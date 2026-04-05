@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Maze Editor (Logic Generator)</title>
+    <style>
+        body { font-family: sans-serif; background: #222; color: #fff; display: flex; flex-direction: column; align-items: center; padding: 20px; }
+        #grid { display: grid; gap: 2px; background: #555; padding: 2px; border: 2px solid #000; box-shadow: 0 0 15px rgba(0,0,0,0.5); }
+        .cell { width: 40px; height: 40px; background: #ddd; cursor: pointer; transition: 0.1s; }
+        .cell:hover { opacity: 0.8; }
+        .cell.wall { background: #333; }
+        .cell.start { background: #00ffaa !important; cursor: not-allowed; display: flex; align-items: center; justify-content: center; color: #000; font-weight: bold; font-size: 12px;}
+        .cell.goal { background: #ff5555 !important; cursor: pointer; display: flex; align-items: center; justify-content: center; color: #fff; font-weight: bold; font-size: 12px;}
+        
+        .controls { margin-top: 20px; display: flex; gap: 15px; align-items: center; flex-wrap: wrap; justify-content: center; max-width: 600px;}
+        button { padding: 12px 20px; cursor: pointer; background: #4db8ff; border: none; font-weight: bold; font-size: 14px; border-radius: 4px; transition: 0.2s; color: #000;}
+        button:hover { background: #70caff; transform: scale(1.05); }
+        
+        #btn-send { background: #ffaa00; font-size: 16px; }
+        #btn-send:hover { background: #ffcc00; }
+        
+        #status { color: #ff5555; font-family: monospace; font-size: 16px; font-weight: bold; margin-left: 20px;}
+        .desc { max-width: 500px; text-align: center; color: #aaa; line-height: 1.5; margin-bottom: 20px; }
+        
+        .tools-group { display: flex; gap: 10px; margin-bottom: 15px; width: 100%; justify-content: center;}
+    </style>
+</head>
+<body>
+    <h2>2D Maze Level Builder</h2>
+    <div class="desc">Generates grid-based logic and streams the 2D array data to the 3D renderer via WebSocket.</div>
+    
+    <div class="tools-group">
+        <button id="btn-random">🎲 Random Maze</button>
+        <button id="btn-pillars">🏛️ Pillars</button>
+        <button id="btn-clear">🔳 Clear All</button>
+    </div>
+
+    <div id="grid"></div>
+    
+    <div class="controls">
+        <button id="btn-send">🚀 Send to Player</button>
+        <span id="status">🔴 Offline</span>
+    </div>
+
+    <script>
+        const width = 15;
+        const height = 15;
+        let mazeData = [];
+
+        const gridEl = document.getElementById('grid');
+        const host = window.location.hostname || 'localhost';
+        const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const ws = new WebSocket(`${wsProtocol}//${host}:8080`);
+        const statusEl = document.getElementById('status');
+
+        // Fills the grid with empty space, preserving the outer boundaries
+        function generateClear() {
+            mazeData = [];
+            for (let z = 0; z < height; z++) {
+                let row = [];
+                for (let x = 0; x < width; x++) {
+                    if (z === 0 || z === height - 1 || x === 0 || x === width - 1) row.push(1);
+                    else row.push(0);
+                }
+                mazeData.push(row);
+            }
+            renderGrid();
+        }
+
+        // Generates a grid pattern of evenly spaced pillars
+        function generatePillars() {
+            mazeData = [];
+            for (let z = 0; z < height; z++) {
+                let row = [];
+                for (let x = 0; x < width; x++) {
+                    if (z === 0 || z === height - 1 || x === 0 || x === width - 1) {
+                        row.push(1);
+                    } else if (z % 2 === 0 && x % 2 === 0) {
+                        row.push(1);
+                    } else {
+                        row.push(0);
+                    }
+                }
+                mazeData.push(row);
+            }
+            mazeData[1][1] = 0;
+            renderGrid();
+        }
+
+        // Generates a fully solvable maze using Depth-First Search (Recursive Backtracker)
+        function generateRandomMaze() {
+            mazeData = [];
+            for (let z = 0; z < height; z++) {
+                let row = [];
+                for (let x = 0; x < width; x++) {
+                    row.push(1);
+                }
+                mazeData.push(row);
+            }
+
+            // Recursive function to carve paths through the solid grid
+            function dig(x, z) {
+                mazeData[z][x] = 0;
+
+                let dirs = [
+                    {dx: 0, dz: -2},
+                    {dx: 0, dz: 2},
+                    {dx: -2, dz: 0},
+                    {dx: 2, dz: 0}
+                ];
+                
+                // Randomize directional order to create organic paths
+                for (let i = dirs.length - 1; i > 0; i--) {
+                    const j = Math.floor(Math.random() * (i + 1));
+                    [dirs[i], dirs[j]] = [dirs[j], dirs[i]];
+                }
+
+                // Check 2 cells ahead; if it's a wall, carve through
+                for (let i = 0; i < dirs.length; i++) {
+                    let nx = x + dirs[i].dx;
+                    let nz = z + dirs[i].dz;
+
+                    if (nx > 0 && nx < width - 1 && nz > 0 && nz < height - 1) {
+                        if (mazeData[nz][nx] === 1) {
+                            mazeData[z + dirs[i].dz / 2][x + dirs[i].dx / 2] = 0;
+                            dig(nx, nz);
+                        }
+                    }
+                }
+            }
+
+            dig(1, 1);
+            mazeData[height - 2][width - 2] = 0; // Ensure goal area is open
+            renderGrid();
+        }
+
+        // Builds the DOM representation of the grid
+        function renderGrid() {
+            gridEl.style.gridTemplateColumns = `repeat(${width}, 40px)`;
+            gridEl.innerHTML = '';
+            for (let z = 0; z < height; z++) {
+                for (let x = 0; x < width; x++) {
+                    const cell = document.createElement('div');
+                    cell.className = 'cell';
+                    if (mazeData[z][x] === 1) cell.classList.add('wall');
+                    
+                    if (x === 1 && z === 1) {
+                        cell.classList.add('start');
+                        cell.innerText = 'P1';
+                    } else if (x === width - 2 && z === height - 2) {
+                        cell.classList.add('goal');
+                        cell.innerText = 'G';
+                    }
+                    
+                    // Toggle wall state on click
+                    cell.onclick = () => {
+                        if (x === 1 && z === 1) return;
+                        if (z === 0 || z === height-1 || x === 0 || x === width-1) return;
+                        mazeData[z][x] = mazeData[z][x] === 1 ? 0 : 1;
+                        renderGrid();
+                    };
+                    gridEl.appendChild(cell);
+                }
+            }
+        }
+
+        generateRandomMaze();
+
+        document.getElementById('btn-random').onclick = generateRandomMaze;
+        document.getElementById('btn-pillars').onclick = generatePillars;
+        document.getElementById('btn-clear').onclick = generateClear;
+
+        // WebSocket Event Handlers
+        ws.onopen = () => {
+            statusEl.innerText = '🟢 Server Connected';
+            statusEl.style.color = '#00ffaa';
+            
+            setTimeout(() => {
+                if(ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: 'maze_update', data: mazeData }));
+                }
+            }, 500);
+        };
+
+        ws.onmessage = (event) => {
+            const msg = JSON.parse(event.data);
+            if (msg.type === 'maze_update') {
+                mazeData = msg.data;
+                renderGrid();
+            }
+        };
+
+        ws.onclose = () => {
+            statusEl.innerText = '🔴 Offline';
+            statusEl.style.color = '#ff5555';
+        };
+
+        // Manual dispatch button
+        document.getElementById('btn-send').onclick = () => {
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'maze_update', data: mazeData }));
+            }
+        };
+    </script>
+</body>
+</html>

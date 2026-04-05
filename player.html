@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Renderer (Player Client) - WebGPU</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; }
+        canvas { display: block; }
+        #ui { position: absolute; top: 10px; left: 10px; color: #fff; font-family: monospace; font-size: 14px; background: rgba(0,0,0,0.7); padding: 15px; border-left: 3px solid #00ffaa; border-radius: 4px; z-index: 10;}
+        .highlight { color: #00ffaa; font-weight: bold; }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.183.0/build/three.webgpu.js",
+                "three/webgpu": "https://cdn.jsdelivr.net/npm/three@0.183.0/build/three.webgpu.js",
+                "three/tsl": "https://cdn.jsdelivr.net/npm/three@0.183.0/build/three.tsl.js"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="ui">
+        <b>Dungeon Crawler Renderer (WebGPU)</b><br>
+        Status: <span id="status" style="color:#ff5555">Offline</span><br><br>
+        Controls: <span class="highlight">W, A, S, D</span> or <span class="highlight">Arrows</span><br>
+        (Move and Rotate based on Action Queue)
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three/webgpu';
+        import { positionWorld, normalize, mix, color, max } from 'three/tsl';
+
+        let scene, camera, renderer, mazeGroup;
+        let clock = new THREE.Clock();
+
+        const cellSize = 10;
+        const wallHeight = 10;
+        let mazeData = []; 
+
+        const playerState = {
+            x: 0, z: 0, y: wallHeight / 2, 
+            rotationY: -Math.PI / 2,
+            isRotating: false, targetRotationY: 0, startRotationY: 0, rotationProgress: 0, rotationAnimationDuration: 0.2,
+            gridX: 1, gridZ: 1, isMoving: false, targetWorldX: 0, targetWorldZ: 0, startWorldX: 0, startWorldZ: 0,
+            moveProgress: 0, moveAnimationDuration: 0.25, targetGridX: 0, targetGridZ: 0, actionQueue: []
+        };
+
+        // Initialize WebSocket connection
+        const host = window.location.hostname || 'localhost';
+        const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const ws = new WebSocket(`${wsProtocol}//${host}:8080`);
+
+        ws.onopen = () => document.getElementById('status').innerHTML = '<span style="color:#00ffaa">Connected to Server</span>';
+        ws.onclose = () => document.getElementById('status').innerHTML = '<span style="color:#ff5555">Offline</span>';
+        
+        ws.onmessage = (event) => {
+            const msg = JSON.parse(event.data);
+            if (msg.type === 'maze_update') {
+                createMaze(msg.data);
+            }
+        };
+
+        function init() {
+            // Setup WebGPU Renderer
+            renderer = new THREE.WebGPURenderer({ antialias: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            document.body.appendChild(renderer.domElement);
+
+            scene = new THREE.Scene();
+
+            // Generate procedural sky gradient using TSL
+            const skyGeo = new THREE.SphereGeometry(500, 32, 15);
+            const skyMat = new THREE.MeshBasicNodeMaterial(); 
+            skyMat.side = THREE.BackSide;
+            
+            const dir = normalize(positionWorld);
+            const topColor = color(new THREE.Color(0.15, 0.45, 0.9));
+            const bottomColor = color(new THREE.Color(0.65, 0.85, 1.0));
+            const blend = max(dir.y, 0.0);
+            
+            skyMat.colorNode = mix(bottomColor, topColor, blend);
+
+            const sky = new THREE.Mesh(skyGeo, skyMat);
+            scene.add(sky);
+
+            mazeGroup = new THREE.Group();
+            scene.add(mazeGroup);
+
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+
+            // Initialize player position in world space
+            playerState.gridX = 1;
+            playerState.gridZ = 1;
+            playerState.x = (playerState.gridX + 0.5) * cellSize;
+            playerState.z = (playerState.gridZ + 0.5) * cellSize;
+            playerState.y = wallHeight / 2;
+            camera.position.y = playerState.y;
+
+            const ambientLight = new THREE.AmbientLight(0x88aabb, 0.8);
+            scene.add(ambientLight);
+            
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 1.5); 
+            directionalLight.position.set(0.5, 1.0, 0.5).normalize();
+            scene.add(directionalLight);
+
+            updateCameraTransform();
+            setupControls();
+            
+            window.addEventListener('resize', onWindowResize, false);
+            
+            // Start the main render loop
+            renderer.setAnimationLoop(animate);
+        }
+
+        // Rebuild 3D geometry based on received 2D array data
+        function createMaze(newData) {
+            mazeData = newData;
+
+            while(mazeGroup.children.length > 0){ 
+                const child = mazeGroup.children[0];
+                mazeGroup.remove(child); 
+                if(child.geometry) child.geometry.dispose();
+                if(child.material) child.material.dispose();
+            }
+
+            const textureLoader = new THREE.TextureLoader();
+            const wallTexture = textureLoader.load('https://raw.githubusercontent.com/mrdoob/three.js/dev/examples/textures/brick_diffuse.jpg');
+            wallTexture.wrapS = wallTexture.wrapT = THREE.RepeatWrapping;
+            wallTexture.colorSpace = THREE.SRGBColorSpace; 
+
+            const wallMaterial = new THREE.MeshStandardMaterial({ map: wallTexture, roughness: 0.9, metalness: 0.1 });
+
+            const floorTexture = textureLoader.load('https://raw.githubusercontent.com/mrdoob/three.js/dev/examples/textures/hardwood2_diffuse.jpg');
+            floorTexture.wrapS = floorTexture.wrapT = THREE.RepeatWrapping;
+            floorTexture.repeat.set(mazeData[0].length / 2, mazeData.length / 2);
+            floorTexture.colorSpace = THREE.SRGBColorSpace;
+
+            const floorMaterial = new THREE.MeshStandardMaterial({ map: floorTexture, roughness: 0.8, metalness: 0.2 });
+
+            const wallGeometry = new THREE.BoxGeometry(cellSize, wallHeight, cellSize);
+
+            for (let z = 0; z < mazeData.length; z++) {
+                for (let x = 0; x < mazeData[z].length; x++) {
+                    if (mazeData[z][x] === 1) {
+                        const wall = new THREE.Mesh(wallGeometry, wallMaterial);
+                        wall.position.set(x * cellSize + cellSize / 2, wallHeight / 2, z * cellSize + cellSize / 2);
+                        mazeGroup.add(wall);
+                    }
+                }
+            }
+
+            const mazeWidth = mazeData[0].length * cellSize;
+            const mazeDepth = mazeData.length * cellSize;
+            
+            const floor = new THREE.Mesh(new THREE.PlaneGeometry(mazeWidth, mazeDepth), floorMaterial);
+            floor.rotation.x = -Math.PI / 2;
+            floor.position.set(mazeWidth / 2, 0, mazeDepth / 2);
+            mazeGroup.add(floor);
+
+            // Handle collision recovery if the player gets stuck inside a newly spawned wall
+            if (mazeData[playerState.gridZ] && mazeData[playerState.gridZ][playerState.gridX] === 1) {
+                playerState.gridX = 1;
+                playerState.gridZ = 1;
+                playerState.x = (playerState.gridX + 0.5) * cellSize;
+                playerState.z = (playerState.gridZ + 0.5) * cellSize;
+                updateCameraTransform();
+            }
+        }
+
+        // Apply calculated coordinates to the actual camera object
+        function updateCameraTransform() {
+            camera.position.x = playerState.x;
+            camera.position.y = playerState.y;
+            camera.position.z = playerState.z;
+            camera.rotation.y = playerState.rotationY;
+        }
+
+        // Wrap angle between 0 and 2*PI for reliable directional checks
+        function normalizeAngle(angle) {
+            angle = angle % (2 * Math.PI);
+            if (angle < 0) angle += 2 * Math.PI;
+            return angle;
+        }
+
+        function startRotationAnimation(turnDirection) {
+            playerState.isRotating = true;
+            playerState.startRotationY = playerState.rotationY;
+            playerState.targetRotationY = playerState.rotationY + turnDirection * (Math.PI / 2);
+            playerState.rotationProgress = 0;
+        }
+
+        function startMoveAnimation(moveType) {
+            let dirX = 0, dirZ = 0;
+            const angle = normalizeAngle(playerState.rotationY);
+            const eps = 0.1;
+
+            switch (moveType) {
+                case 'forward':
+                    if (Math.abs(angle - 0) < eps || Math.abs(angle - 2 * Math.PI) < eps) dirZ = -1;
+                    else if (Math.abs(angle - Math.PI / 2) < eps) dirX = -1;
+                    else if (Math.abs(angle - Math.PI) < eps) dirZ = 1;
+                    else if (Math.abs(angle - 3 * Math.PI / 2) < eps) dirX = 1;
+                    break;
+                case 'backward':
+                    if (Math.abs(angle - 0) < eps || Math.abs(angle - 2 * Math.PI) < eps) dirZ = 1;
+                    else if (Math.abs(angle - Math.PI / 2) < eps) dirX = 1;
+                    else if (Math.abs(angle - Math.PI) < eps) dirZ = -1;
+                    else if (Math.abs(angle - 3 * Math.PI / 2) < eps) dirX = -1;
+                    break;
+                case 'strafe_left':
+                    if (Math.abs(angle - 0) < eps || Math.abs(angle - 2 * Math.PI) < eps) dirX = -1;
+                    else if (Math.abs(angle - Math.PI / 2) < eps) dirZ = 1;
+                    else if (Math.abs(angle - Math.PI) < eps) dirX = 1;
+                    else if (Math.abs(angle - 3 * Math.PI / 2) < eps) dirZ = -1;
+                    break;
+                case 'strafe_right':
+                    if (Math.abs(angle - 0) < eps || Math.abs(angle - 2 * Math.PI) < eps) dirX = 1;
+                    else if (Math.abs(angle - Math.PI / 2) < eps) dirZ = -1;
+                    else if (Math.abs(angle - Math.PI) < eps) dirX = -1;
+                    else if (Math.abs(angle - 3 * Math.PI / 2) < eps) dirZ = 1;
+                    break;
+            }
+            
+            const nextX = playerState.gridX + dirX;
+            const nextZ = playerState.gridZ + dirZ;
+
+            // Reject movement if the target cell is out of bounds or obstructed by a wall
+            if (nextZ < 0 || nextZ >= mazeData.length || nextX < 0 || nextX >= mazeData[0].length || mazeData[nextZ][nextX] === 1) {
+                return false; 
+            }
+
+            playerState.isMoving = true;
+            playerState.startWorldX = playerState.x;
+            playerState.startWorldZ = playerState.z;
+            playerState.targetGridX = nextX;
+            playerState.targetGridZ = nextZ;
+            playerState.targetWorldX = (nextX + 0.5) * cellSize;
+            playerState.targetWorldZ = (nextZ + 0.5) * cellSize;
+            playerState.moveProgress = 0;
+            return true; 
+        }
+
+        // Register keyboard events into the action queue
+        function setupControls() {
+            document.addEventListener('keydown', (event) => {
+                const key = event.key.toLowerCase();
+                let action = null;
+
+                if (key === 'a' || key === 'arrowleft') action = { type: 'rotate', direction: 1 };
+                else if (key === 'd' || key === 'arrowright') action = { type: 'rotate', direction: -1 };
+                else if (key === 'w' || key === 'arrowup') action = { type: 'move', moveType: 'forward' };
+                else if (key === 's' || key === 'arrowdown') action = { type: 'move', moveType: 'backward' };
+                else if (key === 'q') action = { type: 'move', moveType: 'strafe_left' };
+                else if (key === 'e') action = { type: 'move', moveType: 'strafe_right' };
+
+                if (action && playerState.actionQueue.length < 5) {
+                    playerState.actionQueue.push(action);
+                }
+            });
+        }
+
+        // Interpolate camera transformations based on delta time
+        function handleMovement(deltaTime) {
+            const easeInOutQuad = t => t < .5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+
+            if (playerState.isRotating) {
+                playerState.rotationProgress = Math.min(playerState.rotationProgress + deltaTime / playerState.rotationAnimationDuration, 1.0);
+                const eased = easeInOutQuad(playerState.rotationProgress);
+                playerState.rotationY = THREE.MathUtils.lerp(playerState.startRotationY, playerState.targetRotationY, eased);
+                updateCameraTransform();
+
+                if (playerState.rotationProgress >= 1.0) {
+                    playerState.rotationY = normalizeAngle(playerState.targetRotationY);
+                    playerState.isRotating = false;
+                }
+            }
+            else if (playerState.isMoving) {
+                playerState.moveProgress = Math.min(playerState.moveProgress + deltaTime / playerState.moveAnimationDuration, 1.0);
+                const eased = easeInOutQuad(playerState.moveProgress);
+                playerState.x = THREE.MathUtils.lerp(playerState.startWorldX, playerState.targetWorldX, eased);
+                playerState.z = THREE.MathUtils.lerp(playerState.startWorldZ, playerState.targetWorldZ, eased);
+                updateCameraTransform();
+
+                if (playerState.moveProgress >= 1.0) {
+                    playerState.x = playerState.targetWorldX;
+                    playerState.z = playerState.targetWorldZ;
+                    playerState.gridX = playerState.targetGridX;
+                    playerState.gridZ = playerState.targetGridZ;
+                    playerState.isMoving = false;
+                }
+            }
+
+            // Fetch the next action when idle
+            while (!playerState.isMoving && !playerState.isRotating && playerState.actionQueue.length > 0) {
+                const nextAction = playerState.actionQueue.shift();
+                if (nextAction.type === 'rotate') {
+                    startRotationAnimation(nextAction.direction);
+                } else if (nextAction.type === 'move') {
+                    const canMove = startMoveAnimation(nextAction.moveType);
+                    // Discard remaining actions if a move is blocked
+                    if (!canMove && playerState.actionQueue.length === 0) break;
+                }
+            }
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            handleMovement(clock.getDelta());
+            renderer.render(scene, camera);
+        }
+
+        init();
+    </script>
+</body>
+</html>
