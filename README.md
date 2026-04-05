@@ -4,7 +4,7 @@ A minimalist Proof of Concept (PoC) demonstrating a **decoupled architecture** w
 
 The renderer utilizes the modern **WebGPU API** and **TSL (Three Shading Language)** via Three.js (r183).
 
-![Screenshot placeholder](https://via.placeholder.com/800x400.png?text=Maze+Streamer+Preview) <!-- 実際のスクリーンショットURLに差し替えてください -->
+![Maze Streamer Preview](screenshot.png)
 
 ## 🌟 Key Concept: "Decoupled Data and Rendering"
 
@@ -30,7 +30,7 @@ This architecture serves as a foundational step toward more complex systems (suc
 
 ### 1. Clone the repository
 ```bash
-git clone https://github.com/yourusername/websocket-maze-streamer.git
+git clone https://github.com/MEBYCentral/websocket-maze-streamer.git
 cd websocket-maze-streamer
 ```
 
